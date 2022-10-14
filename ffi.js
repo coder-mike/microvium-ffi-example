@@ -12,6 +12,7 @@ const imports = [];
 let nextImportID = 0xFFFF;
 
 const headers = [];
+const memberDeclarations = [];
 const internalHeaders = [];
 const implementations = [];
 
@@ -19,9 +20,9 @@ const onRestoreListeners = [];
 
 const typeToCLookup = {
   void: 'void',
-  any: 'mvm_Value',
+  any: 'mvm::Any',
   bool: 'bool',
-  string: 'const char*',
+  string: 'std::string',
   int: 'int32_t',
   float: 'double',
 }
@@ -33,25 +34,23 @@ export function exportToC(returnType, name, args, func) {
 
   const exportInfo = getNextExportID(name);
 
-  const header = `\n${cSignature};`
+  const header = `\n  ${cSignature};`
   const implementation = appName => `
-${cSignature} {
-  mvm_VM* _vm = ${appName}_vm;
-
-  // Prepare the arguments
+${emitSignature(returnType, `${appName}::${name}`, args)} {
+  ${args.length ? `// Prepare the arguments` : ''}
   ${args.length ? `mvm_Value _args[${args.length}];` : ''}
   ${join(map(args, (a, i) => `_args[${i}] = ${emitIncomingConversion(a[0], a[1])};`), '\n  ')}
   mvm_Value _result;
 
   // Call the JS function
-  mvm_TeError err = mvm_call(${appName}_vm, _vmExports[${exportInfo.index}], &_result, ${args.length ? '_args' : 'NULL'}, ${args.length});
+  mvm_TeError err = mvm_call(_vm, _vmExports[${exportInfo.index}], &_result, ${args.length ? '_args' : 'NULL'}, ${args.length});
   if (err != MVM_E_SUCCESS) MVM_FATAL_ERROR(_vm, err);
 
   // Convert/return the result
   return ${emitOutgoingConversion(returnType, '_result')};
 }`;
 
-  headers.push(header);
+  memberDeclarations.push(header);
   implementations.push(implementation);
 
   vmExport(exportInfo.id, func);
@@ -62,8 +61,8 @@ function emitSignature(returnType, name, args) {
 }
 
 export function importFromC(returnType, name, args) {
-  const cSignature = emitSignature(returnType, name, args);
-  const header = `\nextern ${cSignature}; // Must be implemented elsewhere`
+  const cSignature = appName => `${typeToC(returnType)} ${name}(${appName}& app, ${join(map(args, emitArg), ', ')})`;
+  const header = appName => `\nextern ${cSignature(appName)}; // Must be implemented elsewhere`
   headers.push(header);
 
   const wrapperName = `_${name}_wrapper`;
@@ -73,14 +72,16 @@ export function importFromC(returnType, name, args) {
 
   const implementation = appName => `
 ${wrapperSignature} {
+  ${appName}* _app = (${appName}*)mvm_getContext(_vm);
+
   // Prepare the arguments
   ${join(map(args, emitImportArg), '\n  ')}
 
   // Call the C function
-  ${returnType === 'void' ? '' : `${typeToC(returnType)} __result = `}${name}(${join(map(args, a => a[1]), ', ')});
+  ${returnType === 'void' ? '' : `${typeToC(returnType)} __result = `}${name}(*_app, ${join(map(args, a => a[1]), ', ')});
 
   // Convert the result
-  ${returnType === 'void' ? `*_result = mvm_undefined;` : `*_result = ${emitIncomingConversion(returnType, '__result')}` }
+  ${returnType === 'void' ? `*_result = mvm_undefined;` : `*_result = ${emitIncomingConversion(returnType, '__result')};` }
 
   return MVM_E_SUCCESS;
 }
@@ -100,7 +101,7 @@ function emitImportArg(arg, i) {
  * Run a function when the VM is restored
  */
 export function onRestore(func) {
-  onRestoreListeners.push();
+  onRestoreListeners.push(func);
 }
 
 function emitArg(arg) {
@@ -109,11 +110,11 @@ function emitArg(arg) {
 
 function emitIncomingConversion(type, name) {
   switch (type) {
-    case 'any': return name;
-    case 'bool': return `mvm_newBoolean(${name});`;
-    case 'int': return `mvm_newInt32(_vm, ${name});`;
-    case 'float': return `mvm_newNumber(_vm, ${name});`;
-    case 'string': return `mvm_newString(_vm, ${name}, strlen(${name}));`;
+    case 'any': return `${name}.value()`;
+    case 'bool': return `mvm_newBoolean(${name})`;
+    case 'int': return `mvm_newInt32(_vm, ${name})`;
+    case 'float': return `mvm_newNumber(_vm, ${name})`;
+    case 'string': return `mvm_newString(_vm, ${name}.c_str(), ${name}.size())`;
     default: return `/* unknown arg type ${type} for arg ${name} */`;
   }
 }
@@ -121,12 +122,12 @@ function emitIncomingConversion(type, name) {
 function emitOutgoingConversion(type, value) {
   switch (type) {
     case 'void': return ``;
-    case 'any': return value;
-    case 'bool': return `mvm_toBool(${value});`;
-    case 'int': return `mvm_toInt32(_vm, ${value});`;
-    case 'float': return `mvm_toFloat64(_vm, ${value});`;
-    case 'string': return `mvm_toStringUtf8(_vm, ${value}, NULL);`;
-    default: return `/* unknown return type ${type} */;`;
+    case 'any': return `mvm::Any(_vm, ${value})`;
+    case 'bool': return `mvm_toBool(${value})`;
+    case 'int': return `mvm_toInt32(_vm, ${value})`;
+    case 'float': return `mvm_toFloat64(_vm, ${value})`;
+    case 'string': return `std::string(mvm_toStringUtf8(_vm, ${value}, NULL))`;
+    default: return `/* unknown return type ${type} */`;
   }
 }
 
@@ -147,10 +148,10 @@ function getNextImportID(name) {
 }
 
 export function generate(appName) {
-  appName = appName || 'app';
+  appName = appName || 'App';
 
-  const ffiHeaderName = `${appName}_ffi.h`;
-  const ffiImplementationName = `${appName}_ffi.c`;
+  const ffiHeaderName = `${appName}_ffi.hpp`;
+  const ffiImplementationName = `${appName}_ffi.cpp`;
 
   const header = `
 // ------------------------- Beginning of header -----------------------------
@@ -161,22 +162,67 @@ export function generate(appName) {
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
+#include <vector>
+#include <stdexcept>
 #include "microvium.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace mvm {
+  // Oi, this needs a refactor
+  struct Any {
+    Any(mvm_VM* vm, mvm_Value value): _vm(vm) { mvm_initializeHandle(_vm, &_handle); mvm_handleSet(&_handle, value); }
+    Any(const Any& other): _vm(other._vm) { mvm_initializeHandle(_vm, &_handle); mvm_handleSet(&_handle, other.value()); }
+    ~Any() { mvm_releaseHandle(_vm, &_handle); }
+    mvm_Value value() const { return mvm_handleGet(&_handle); }
 
-extern mvm_VM* ${appName}_vm;
+    mvm_TeType type() const { return mvm_typeOf(_vm, value()); }
 
-void ${appName}_restore(const uint8_t* snapshot, size_t snapshotSize);
-void ${appName}_free();
+    bool toBool() const { return mvm_toBool(_vm, value()); }
+    int32_t toInt32() const { return mvm_toInt32(_vm, value()); }
+    MVM_FLOAT64 toFloat64() const { return mvm_toFloat64(_vm, value()); }
+    std::string toString() const { size_t n; const char* s = mvm_toStringUtf8(_vm, value(), &n); return std::string(s, n); }
 
-${join(headers, '')}
+    std::vector<uint8_t> uint8ArrayToBytes() const {
+      uint8_t* d; size_t n;
+      if (mvm_uint8ArrayToBytes(_vm, value(), &d, &n) != MVM_E_SUCCESS)
+        throw std::runtime_error("Microvium error");
+      return std::vector<uint8_t>(d, d + n);
+    }
 
-#ifdef __cplusplus
-} // extern "C"
-#endif
+    bool isNaN() const { return mvm_isNaN(value()); }
+  private:
+    mvm_VM* _vm;
+    mvm_Handle _handle;
+  };
+
+  class VM {
+  public:
+    ~VM() { mvm_free(_vm); _vm = NULL; }
+
+    Any newBoolean(bool value) { return Any(_vm, mvm_newBoolean(value)); }
+    Any newInt32(int32_t value) { return Any(_vm, mvm_newInt32(_vm, value)); }
+    Any newNumber(MVM_FLOAT64 value) { return Any(_vm, mvm_newNumber(_vm, value)); }
+    Any newString(const std::string& value) { return Any(_vm, mvm_newString(_vm, value.c_str(), value.length())); }
+    Any uint8ArrayFromBytes(std::vector<uint8_t> value) { return Any(_vm, mvm_uint8ArrayFromBytes(_vm, value.data(), value.size())); }
+
+    mvm_VM* vm() { return _vm; }
+  protected:
+    VM(): _vm(NULL) {}
+    mvm_VM* _vm;
+  };
+}
+
+class ${appName}: public mvm::VM {
+public:
+  ${appName}(const uint8_t* snapshot, size_t snapshotSize);
+
+  void restore(const uint8_t* snapshot, size_t snapshotSize);
+  void free();
+
+  ${join(memberDeclarations, '')}
+};
+
+${join(map(headers, h => h(appName)), '')}
 
 // --------------------------- End of header --------------------------------
 `;
@@ -188,8 +234,6 @@ ${join(headers, '')}
 // WARNING: This file is auto-generated. DO NOT EDIT
 
 #include "${ffiHeaderName}"
-
-mvm_VM* ${appName}_vm = NULL;
 
 static const mvm_VMExportID _vmExportsIDs[${exports.length}] = {
   ${join(map(exports, (e, i) => `/*[${i}]*/ ${e.id}, // ${e.name}`), '\n  ')}
@@ -212,28 +256,25 @@ static const ImportRecord _vmImports[${imports.length}] = {
 
 static mvm_TeError resolveImport(mvm_HostFunctionID hostFunctionID, void* context, mvm_TfHostFunction* out_hostFunction);
 
-void ${appName}_restore(const uint8_t* snapshot, size_t snapshotSize) {
+${appName}::${appName}(const uint8_t* snapshot, size_t snapshotSize): mvm::VM() {
   mvm_TeError err;
 
-  err = mvm_restore(&${appName}_vm, (MVM_LONG_PTR_TYPE)snapshot, snapshotSize, NULL, resolveImport);
+  err = mvm_restore(&_vm, (MVM_LONG_PTR_TYPE)snapshot, snapshotSize, this, resolveImport);
   if (err != MVM_E_SUCCESS) MVM_FATAL_ERROR(_vm, err);
 
-  err = mvm_resolveExports(&${appName}_vm, _vmExportsIDs, _vmExports, ${exports.length});
+  err = mvm_resolveExports(_vm, _vmExportsIDs, _vmExports, ${exports.length});
   if (err != MVM_E_SUCCESS) MVM_FATAL_ERROR(_vm, err);
 
   runRestoreEvents();
 }
 
-void ${appName}_free() {
-  if (!${appName}_vm) return;
-  mvm_free(${appName}_vm);
-  ${appName}_vm = NULL;
-}
-
 static mvm_TeError resolveImport(mvm_HostFunctionID hostFunctionID, void* context, mvm_TfHostFunction* out_hostFunction) {
   ${!imports.length ? `// There are no exports\n  return MVM_E_FUNCTION_NOT_FOUND;` : `
   for (int i = 0; i < ${imports.length}; i++) {
-    if (_vmImports[i].id == hostFunctionID) return _vmImports[i].func;
+    if (_vmImports[i].id == hostFunctionID) {
+      *out_hostFunction = _vmImports[i].func;
+      return MVM_E_SUCCESS;
+    }
   }
   return MVM_E_FUNCTION_NOT_FOUND;
   `}
